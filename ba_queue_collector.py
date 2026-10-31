@@ -6,7 +6,7 @@
 - 空格子无副作用：点击后左侧面板不变 → 条带与上一格相同 → 哈希去重跳过 OCR
 - 条带哈希去重：重叠行/空格重复条带不入队，消费者只 OCR 新内容
 - 到底判定（覆盖率口径）：同一页连续 ≥2 屏、且页内每个被点击的格子都产出有效读数/
-  确认重复/重试上限后放弃 → 本页构造性完整即停；兜底：排空后连续 3 轮零新增、
+  确认重复/重试上限后放弃 → 本页构造性完整即停；兜底：连续 2 次队列排空检查零新增、
   或连续 2 屏无角标
 - 滚轮：先 SetCursorPos 到网格质心，确保滚动作用于游戏列表
 - 名称条带与截图区域均锚定游戏窗口矩形（GetWindowRect），支持任意窗口位置/分辨率
@@ -105,6 +105,10 @@ BADGE_CLICK_DY = 56.0                # 角标在格子中心下方 56px*s 处
 HASH_THRESH = 0.2                    # 条带缩略图 mean|diff| 判重阈值（面板静态，同内容 diff≈0）
 MAX_SCREENS = 80
 RETRY_LIMIT = 3                      # 台账中单格读取失败的重试上限，超过后放弃（giveup）
+PAGE_SAME_THRESH = 0.25              # 页哈希判定"同一页"的阈值。页哈希用 32×12 粗分辨率：
+                                     # 吸收探测行点击/选中高亮/静止位置 ±数 px 的抖动（实测会让
+                                     # 64×24 细哈希误判换页、底部验证模式反复退回全格扫）；
+                                     # 真实滚动是内容整体位移 10 个哈希行，信号远大于阈值
 # 弹窗关键词（顯示設定/設定对话框等）：同屏命中 ≥2 个才判定为弹窗，避免物品名误伤
 DIALOG_KEYS = ("顯示設定", "显示设定", "全部重置", "過濾器", "过滤器",
                "確認", "取消", "關閉", "关闭")
@@ -586,9 +590,12 @@ def main():
         with SCT_LOCK:
             grid = grab_bgr(None)
         gl, gt, gr, gb = geo["grid_bbox"]
-        h_page = strip_hash(grid[gt:gb, gl:gr])
-        same_page = (page_hash is not None and float(np.mean(
-            np.abs(h_page.astype(np.int16) - page_hash.astype(np.int16)))) < HASH_THRESH)
+        # 页哈希用 32×12 粗分辨率（区别于停稳轮询的 64×24 细哈希）：见 PAGE_SAME_THRESH 注释
+        h_page = cv2.resize(cv2.cvtColor(grid[gt:gb, gl:gr], cv2.COLOR_BGR2GRAY),
+                            (32, 12), interpolation=cv2.INTER_AREA)
+        page_diff = (float(np.mean(np.abs(h_page.astype(np.int16) - page_hash.astype(np.int16))))
+                     if page_hash is not None else None)
+        same_page = page_hash is not None and page_diff < PAGE_SAME_THRESH
         page_hash = h_page
         unchanged_streak = unchanged_streak + 1 if same_page else 0
         row_ys, badges, dialog_open = detect_rows(grid, geo)
@@ -644,9 +651,10 @@ def main():
                 skipped += 1
         uncovered = sum(1 for v in ledger.values() if v["state"] not in ("dup", "valid", "giveup"))
         mode = "verify" if same_page else "sweep "
+        pd = f"{page_diff:.1f}" if page_diff is not None else "-"
         print(f"screen {screen} [{mode}]: rows_detected={len(row_ys)} badges={len(badges)} "
               f"new_strips={clicked} dup={skipped} uncovered={uncovered} "
-              f"({time.time()-t0:.1f}s) rows={len(rows)}",
+              f"pdiff={pd} ({time.time()-t0:.1f}s) rows={len(rows)}",
               flush=True)
         save_rows()
 
@@ -654,7 +662,7 @@ def main():
         # 覆盖率：同一页连续 ≥2 屏（抵御单次滚轮丢失），且台账内每个格子都已产出
         # 有效读数、确认重复、或重试上限后放弃 → 本页构造性完整，整个列表扫描完成。
         # 排空后才评估，保证台账与行计数是最终态。
-        # 新颖性兜底：排空后连续 3 轮零新增（台账异常时的回退路径，原为 ×2）。
+        # 新颖性兜底：连续 2 次队列排空检查零新增（台账异常时的回退路径）。
         if any(not t.is_alive() for t in consumers):
             print("consumer thread died unexpectedly, abort scan", flush=True)
             break
@@ -682,7 +690,7 @@ def main():
                                      else f"row{k[0]} col{k[1]}")
                             print(f"  {where} attempts={v['attempts']}", flush=True)
                 break
-            if quiet >= 3:
+            if quiet >= 2:
                 print(f"bottom reached (fallback: no new rows x{quiet}, rows={len(rows)})",
                       flush=True)
                 stuck = {k: v for k, v in ledger.items()

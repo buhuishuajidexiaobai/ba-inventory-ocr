@@ -5,9 +5,9 @@
   每屏点击目标 = cols × 行中心 全组合，行优先遍历，一格一次（不漏、不乱、不重）
 - 空格子无副作用：点击后左侧面板不变 → 条带与上一格相同 → 哈希去重跳过 OCR
 - 条带哈希去重：重叠行/空格重复条带不入队，消费者只 OCR 新内容
-- 到底判定（覆盖率口径）：同一页连续 ≥2 屏、且页内每个被点击的格子都产出有效读数/
-  确认重复/重试上限后放弃 → 本页构造性完整即停；兜底：连续 2 次队列排空检查零新增、
-  或连续 2 屏无角标
+- 到底判定：排空后连续 2 轮零新增行——"新增"= OCR 解析出全新的 (名称,数量) 元组，
+  滚轮回弹/高亮位移等像素扰动不产生新行，天然免疫；疑似到底（零新增×1）即附带
+  末行投影探测兜底最后一格。另有连续 2 屏无角标兜底
 - 滚轮：先 SetCursorPos 到网格质心，确保滚动作用于游戏列表
 - 名称条带与截图区域均锚定游戏窗口矩形（GetWindowRect），支持任意窗口位置/分辨率
 用法: python ba_queue_collector.py [--fresh]
@@ -104,11 +104,6 @@ WIDE = (0, 1050, 1300, 1450)         # 左侧信息条带（名称横幅+持有�
 BADGE_CLICK_DY = 56.0                # 角标在格子中心下方 56px*s 处
 HASH_THRESH = 0.2                    # 条带缩略图 mean|diff| 判重阈值（面板静态，同内容 diff≈0）
 MAX_SCREENS = 80
-RETRY_LIMIT = 3                      # 台账中单格读取失败的重试上限，超过后放弃（giveup）
-PAGE_SAME_THRESH = 0.25              # 页哈希判定"同一页"的阈值。页哈希用 32×12 粗分辨率：
-                                     # 吸收探测行点击/选中高亮/静止位置 ±数 px 的抖动（实测会让
-                                     # 64×24 细哈希误判换页、底部验证模式反复退回全格扫）；
-                                     # 真实滚动是内容整体位移 10 个哈希行，信号远大于阈值
 # 弹窗关键词（顯示設定/設定对话框等）：同屏命中 ≥2 个才判定为弹窗，避免物品名误伤
 DIALOG_KEYS = ("顯示設定", "显示设定", "全部重置", "過濾器", "过滤器",
                "確認", "取消", "關閉", "关闭")
@@ -470,13 +465,7 @@ def main():
         with open(ROWS_OUT, "w", encoding="utf-8") as f:
             json.dump(snap, f, ensure_ascii=False)
 
-    new_rows_ct = [0]                  # 消费端实际新增行计数（兜底判定用）
-    ledger = {}                        # 页内格子台账 (行序号, 列序号) -> {state, attempts}
-                                       # state ∈ pending/dup/valid/invalid/giveup
-                                       # 键用格位索引而非像素坐标：角标定位有 ±1-2px 抖动，
-                                       # 像素键会让 invalid 条目成为永远点不到的孤儿，
-                                       # 覆盖率检查永不通过（2026-09-29 实测）
-    prev_row_count = None              # 上一屏检测到的行数（行数变化 = 页面结构变，清台账）
+    new_rows_ct = [0]                  # 消费端实际新增行计数（停止判定的核心信号）
 
     q = queue.Queue(maxsize=200)
 
@@ -500,20 +489,19 @@ def main():
         debug_dumped = [0]
 
         while True:
-            job = q.get()
-            if job is None:
+            png = q.get()
+            if png is None:
                 q.task_done()
                 return
-            strip_png, cell_key = job
             name = count = None
             try:
-                lines = ocr_png(strip_png)
+                lines = ocr_png(png)
                 if debug_strip and debug_dumped[0] < 3:
                     debug_dumped[0] += 1
                     os.makedirs(os.path.join(TEMP, "_strip_debug"), exist_ok=True)
                     base = os.path.join(TEMP, "_strip_debug", f"strip{debug_dumped[0]}")
                     with open(base + ".png", "wb") as f:
-                        f.write(strip_png)
+                        f.write(png)
                     with open(base + ".txt", "w", encoding="utf-8") as f:
                         f.write(repr(lines))
                 name, count = parse_wide(lines)
@@ -526,9 +514,6 @@ def main():
                         known.add(row)
                         rows.append(row)
                         new_rows_ct[0] += 1
-                if cell_key is not None:
-                    st = ledger.setdefault(cell_key, {"state": "pending", "attempts": 0})
-                    st["state"] = "valid" if (name and count is not None) else "invalid"
             q.task_done()
 
     # GPU 模式下单专职线程独占显卡带宽吞吐更高且无争用；CPU 模式起 2 线程发挥多核优势
@@ -560,14 +545,11 @@ def main():
 
     # ===== 生产者：确定性点阵遍历 =====
     hash_hist = deque(maxlen=800)    # 最近条带缩略图（判重）
-    page_hash = None                 # 上一屏起始的网格哈希（换页检测）
-    unchanged_streak = 0             # 连续同一页屏数（覆盖率终止要求 ≥2）
-    quiet = 0                        # 兜底：排空后零新增轮数
+    quiet = 0                        # 排空后零新增轮数（到底判定核心信号）
     empty_screens = 0
 
-    def click_cell(cx, cy, cell_key=None):
-        """点击一格。条带与历史重复 → 台账记 dup（无新信息可学）；新条带 → 记 pending
-        入队，由消费者回写 valid/invalid。返回 True=新条带入队。"""
+    def click_cell(cx, cy):
+        """点击一格并按条带哈希去重入队。返回 True=新条带入队。"""
         fast_click(cx, cy)
         time.sleep(CLICK_SLEEP)
         with SCT_LOCK:
@@ -575,29 +557,16 @@ def main():
         h = strip_hash(wide_img)
         if any(float(np.mean(np.abs(h.astype(np.int16) - p.astype(np.int16)))) < HASH_THRESH
                for p in hash_hist):
-            if cell_key is not None and cell_key not in ledger:
-                ledger[cell_key] = {"state": "dup", "attempts": 0}
             return False                 # 空格/重复条带：不入队
         hash_hist.append(h)
-        if cell_key is not None:
-            ledger.setdefault(cell_key, {"state": "pending", "attempts": 0})["state"] = "pending"
         ok_png, png = cv2.imencode(".png", wide_img)
-        q.put((png.tobytes(), cell_key))
+        q.put(png.tobytes())
         return True
 
     for screen in range(1, MAX_SCREENS + 1):
         t0 = time.time()
         with SCT_LOCK:
             grid = grab_bgr(None)
-        gl, gt, gr, gb = geo["grid_bbox"]
-        # 页哈希用 32×12 粗分辨率（区别于停稳轮询的 64×24 细哈希）：见 PAGE_SAME_THRESH 注释
-        h_page = cv2.resize(cv2.cvtColor(grid[gt:gb, gl:gr], cv2.COLOR_BGR2GRAY),
-                            (32, 12), interpolation=cv2.INTER_AREA)
-        page_diff = (float(np.mean(np.abs(h_page.astype(np.int16) - page_hash.astype(np.int16))))
-                     if page_hash is not None else None)
-        same_page = page_hash is not None and page_diff < PAGE_SAME_THRESH
-        page_hash = h_page
-        unchanged_streak = unchanged_streak + 1 if same_page else 0
         row_ys, badges, dialog_open = detect_rows(grid, geo)
         if dialog_open and not row_ys:
             # 弹窗打开（误触設定等）：ESC 取消（未确认改动会被丢弃），本屏重扫
@@ -605,68 +574,38 @@ def main():
             send_esc()
             time.sleep(0.8)
             continue
-
-        # 点击目标：换页（sweep）→ 全格遍历；同一页（verify，含滚轮丢失的罕见情形）
-        # → 只点台账未解决的格子（invalid 重试至 RETRY_LIMIT，dup/valid 不重复），
-        # 并附末行投影探测（格子同样入账，读取失败会被重试而不是漏掉）。
-        # 台账键 = (行序号, 列序号)，对角标定位的 ±1-2px 抖动免疫。
-        if len(row_ys) != prev_row_count:
-            ledger.clear()               # 行数变化 = 页面结构变，旧台账全部作废
-        prev_row_count = len(row_ys)
-
-        def pick(key):
-            """返回该格子是否需要（重新）点击；顺便维护重试计数与放弃标记"""
-            st = ledger.get(key)
-            if st is not None:
-                if st["state"] in ("dup", "valid", "giveup"):
-                    return False
-                if st["state"] == "invalid" and st["attempts"] >= RETRY_LIMIT:
-                    st["state"] = "giveup"
-                    return False
-                if st["state"] == "invalid":
-                    st["attempts"] += 1
-            return True
-
-        targets = []                     # (cell_key, (cx, cy))
-        if same_page:
-            for i, ry in enumerate(row_ys):
-                for j, cx in enumerate(cols):
-                    if pick((i, j)):
-                        targets.append(((i, j), (cx, ry)))
-            if row_ys:
-                probe_y = max(row_ys) + row_spacing
-                if probe_y < (WIN[3] - WIN[1]) - 10:     # 投影行须仍在游戏窗口内
-                    for j, cx in enumerate(cols):
-                        if pick(("p", j)):
-                            targets.append((("p", j), (cx, probe_y)))
-        else:
-            targets = [((i, j), (cx, ry))
-                       for i, ry in enumerate(row_ys) for j, cx in enumerate(cols)]
-
         clicked = skipped = 0
-        for key, (cx, cy) in targets:
-            if click_cell(cx, cy, cell_key=key):
-                clicked += 1
-            else:
-                skipped += 1
-        uncovered = sum(1 for v in ledger.values() if v["state"] not in ("dup", "valid", "giveup"))
-        mode = "verify" if same_page else "sweep "
-        pd = f"{page_diff:.1f}" if page_diff is not None else "-"
-        print(f"screen {screen} [{mode}]: rows_detected={len(row_ys)} badges={len(badges)} "
-              f"new_strips={clicked} dup={skipped} uncovered={uncovered} "
-              f"pdiff={pd} ({time.time()-t0:.1f}s) rows={len(rows)}",
-              flush=True)
+        for ry in row_ys:                       # 行优先全格遍历
+            for cx in cols:
+                if click_cell(cx, ry):
+                    clicked += 1
+                else:
+                    skipped += 1
+        # 疑似到底（排空后零新增已满 1 轮）→ 向下投影一行探测，兜底最后一格
+        # （该格角标可能不可读而从未进入 row_ys；探测点击落在空位时条带自然 dup，无副作用）
+        if quiet >= 1 and row_ys:
+            probe_y = max(row_ys) + row_spacing
+            if probe_y < (WIN[3] - WIN[1]) - 10:     # 投影行须仍在游戏窗口内
+                for cx in cols:
+                    if click_cell(cx, probe_y):
+                        clicked += 1
+                    else:
+                        skipped += 1
+        print(f"screen {screen}: rows_detected={len(row_ys)} badges={len(badges)} "
+              f"new_strips={clicked} dup={skipped} quiet={quiet} "
+              f"({time.time()-t0:.1f}s) rows={len(rows)}", flush=True)
         save_rows()
 
-        # ===== 到底判定（覆盖率口径为主，新颖性口径兜底）=====
-        # 覆盖率：同一页连续 ≥2 屏（抵御单次滚轮丢失），且台账内每个格子都已产出
-        # 有效读数、确认重复、或重试上限后放弃 → 本页构造性完整，整个列表扫描完成。
-        # 排空后才评估，保证台账与行计数是最终态。
-        # 新颖性兜底：连续 2 次队列排空检查零新增（台账异常时的回退路径）。
+        # ===== 到底判定（新颖性口径，纯"识别结果"信号）=====
+        # 每轮全格点击，条带哈希去重只负责省 OCR；停止看消费端解析结果：
+        # 排空后连续 2 轮零新增行（(名称,数量) 元组全新才算新增）→ 到底。
+        # 滚轮回弹/选中高亮位移/点击坐标偏移等一切视觉扰动都不产生新行，天然免疫；
+        # 疑似到底（quiet≥1）的轮次附带末行投影探测，最后一格因此不会被漏掉。
+        # 页哈希换页检测实测两轮都在底部误判（回弹/位移/高亮），已整体移除。
         if any(not t.is_alive() for t in consumers):
             print("consumer thread died unexpectedly, abort scan", flush=True)
             break
-        if q.unfinished_tasks == 0:
+        if q.unfinished_tasks == 0:            # 排空后才评估，new_rows 才是最终态
             with rows_lock:
                 new_rows = new_rows_ct[0]
                 new_rows_ct[0] = 0
@@ -674,33 +613,8 @@ def main():
                 quiet += 1
             else:
                 quiet = 0
-            if (same_page and unchanged_streak >= 2 and ledger
-                    and all(v["state"] in ("dup", "valid", "giveup") for v in ledger.values())):
-                n_valid = sum(1 for v in ledger.values() if v["state"] == "valid")
-                n_dup = sum(1 for v in ledger.values() if v["state"] == "dup")
-                n_give = sum(1 for v in ledger.values() if v["state"] == "giveup")
-                print(f"coverage complete: {len(ledger)} cells (valid={n_valid}, dup={n_dup}, "
-                      f"giveup={n_give}), rows={len(rows)}", flush=True)
-                if n_give:
-                    print("── 放弃的格子（重试 3 次仍读不出，建议跑 ba_icon_linker.py 对齐）──",
-                          flush=True)
-                    for k, v in sorted(ledger.items(), key=lambda kv: str(kv[0])):
-                        if v["state"] == "giveup":
-                            where = (f"probe col{k[1]}" if k[0] == "p"
-                                     else f"row{k[0]} col{k[1]}")
-                            print(f"  {where} attempts={v['attempts']}", flush=True)
-                break
             if quiet >= 2:
-                print(f"bottom reached (fallback: no new rows x{quiet}, rows={len(rows)})",
-                      flush=True)
-                stuck = {k: v for k, v in ledger.items()
-                         if v["state"] not in ("dup", "valid", "giveup")}
-                if stuck:
-                    print("── 未覆盖的台账条目（覆盖率终止被它们卡住）──", flush=True)
-                    for k, v in sorted(stuck.items(), key=lambda kv: str(kv[0])):
-                        where = f"probe col{k[1]}" if k[0] == "p" else f"row{k[0]} col{k[1]}"
-                        print(f"  {where} state={v['state']} attempts={v['attempts']}",
-                              flush=True)
+                print(f"bottom reached (no new rows x{quiet}, rows={len(rows)})", flush=True)
                 break
         if not badges:
             empty_screens += 1
